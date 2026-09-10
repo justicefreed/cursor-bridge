@@ -317,6 +317,50 @@ fn find_agent() -> Option<String> {
     None
 }
 
+/// Collapses the agent's text events into the reply the user should see.
+///
+/// With `--stream-partial-output` the agent streams incremental text events
+/// and then closes each *segment* — the run of text before a tool call, or
+/// before the end of the turn — with a recap event repeating everything that
+/// segment already sent. Forwarding the recap shows that passage twice.
+///
+/// A recap cannot be recognised on arrival: it looks exactly like any other
+/// text event, and `timestamp_ms` does not separate them (only the very last
+/// recap of a turn is untagged, the mid-turn ones are tagged like deltas).
+/// What identifies it is that it closes a segment and repeats it verbatim, so
+/// the most recent event is held back until the segment ends and only then
+/// compared against what was streamed.
+///
+/// An agent too old to know the flag sends one untagged event and no deltas;
+/// it compares unequal to an empty segment and is emitted normally.
+struct TextStream {
+    segment: String,
+    pending: Option<String>,
+}
+
+impl TextStream {
+    fn new() -> Self { Self { segment: String::new(), pending: None } }
+
+    /// Takes the next text event. Returns whatever is now safe to emit.
+    fn push(&mut self, text: &str) -> Option<String> {
+        let ready = self.pending.replace(text.to_string());
+        if let Some(ref t) = ready { self.segment.push_str(t); }
+        ready
+    }
+
+    /// Closes the segment at a tool call or at the end of the turn. Returns
+    /// the held-back event unless it was this segment's recap.
+    fn flush(&mut self) -> Option<String> {
+        let last = self.pending.take();
+        let ready = match last {
+            Some(t) if t != self.segment => Some(t),
+            _ => None,
+        };
+        self.segment.clear();
+        ready
+    }
+}
+
 fn spawn_agent(requested_model: &str) -> std::io::Result<std::process::Child> {
     let path = find_agent().unwrap_or_else(|| { log("agent not found. Install Cursor CLI or set AGENT_PATH."); std::process::exit(1); });
     log(&format!("spawning: {path}"));
@@ -330,7 +374,8 @@ fn spawn_agent(requested_model: &str) -> std::io::Result<std::process::Child> {
     // --force auto-approves tool calls in non-interactive mode.
     // --trust skips workspace trust prompt.
     Command::new(path)
-        .args(["--print", "--force", "--output-format", "stream-json", "--model", requested_model, "--trust"])
+        .args(["--print", "--force", "--output-format", "stream-json", "--stream-partial-output",
+               "--model", requested_model, "--trust"])
         .current_dir(&sandbox)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -362,6 +407,7 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
 
     let reader = BufReader::new(agent.stdout.take().unwrap());
     let mut text = String::new();
+    let mut texts = TextStream::new();
     let mut usage = serde_json::json!({});
 
     for line in reader.lines() {
@@ -371,14 +417,21 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
             if event["type"] == "assistant" {
                 if let Some(arr) = event["message"]["content"].as_array() {
                     for block in arr {
-                        if let Some(t) = block["text"].as_str() { text.push_str(t); }
+                        if let Some(t) = block["text"].as_str() {
+                            if let Some(out) = texts.push(t) { text.push_str(&out); }
+                        }
                     }
                 }
+            }
+            // A tool call closes the current run of text, as does the result.
+            if event["type"] == "tool_call" || event["type"] == "result" {
+                if let Some(out) = texts.flush() { text.push_str(&out); }
             }
             if event["type"] == "result" { usage = event["usage"].clone(); }
         }
     }
     let _ = agent.wait();
+    if let Some(out) = texts.flush() { text.push_str(&out); }
 
     let resp = serde_json::json!({
         "id": format!("msg_{}", std::process::id()), "type": "message", "role": "assistant",
@@ -399,6 +452,24 @@ fn write_sse(stream: &mut TcpStream, event_type: &str, data: &serde_json::Value)
     stream.write_all(json.as_bytes())?;
     stream.write_all(b"\n\n")?;
     stream.flush()
+}
+
+/// Appends text to the open block, opening one first if needed. Anthropic
+/// clients accumulate `content_block_start.text` plus every delta, so the
+/// start must be empty and only deltas may carry content.
+fn emit_text(stream: &mut TcpStream, text: &str, index: i32, block_open: &mut bool) {
+    if text.is_empty() { return; }
+    if !*block_open {
+        let _ = write_sse(stream, "content_block_start", &serde_json::json!({
+            "type": "content_block_start", "index": index,
+            "content_block": {"type": "text", "text": ""}
+        }));
+        *block_open = true;
+    }
+    let _ = write_sse(stream, "content_block_delta", &serde_json::json!({
+        "type": "content_block_delta", "index": index,
+        "delta": {"type": "text_delta", "text": text}
+    }));
 }
 
 fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
@@ -426,6 +497,9 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
     let reader = BufReader::new(agent.stdout.take().unwrap());
     let mut content_index = 0i32;
     let mut result_received = false;
+    // A run of text deltas belongs in one content block, not one block each.
+    let mut text_block_open = false;
+    let mut texts = TextStream::new();
 
     for line in reader.lines() {
         let line = match line { Ok(l) => l, _ => break };
@@ -439,21 +513,26 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                             match block_type {
                                 "text" => {
                                     if let Some(text) = block["text"].as_str() {
-                                        let _ = write_sse(&mut stream, "content_block_start", &serde_json::json!({
-                                            "type": "content_block_start", "index": content_index,
-                                            "content_block": {"type": "text", "text": text}
-                                        }));
-                                        let _ = write_sse(&mut stream, "content_block_delta", &serde_json::json!({
-                                            "type": "content_block_delta", "index": content_index,
-                                            "delta": {"type": "text_delta", "text": text}
-                                        }));
-                                        let _ = write_sse(&mut stream, "content_block_stop", &serde_json::json!({
-                                            "type": "content_block_stop", "index": content_index
-                                        }));
-                                        content_index += 1;
+                                        if text.is_empty() { continue; }
+                                        // TextStream holds one event back so a
+                                        // segment recap can be recognised and dropped.
+                                        if let Some(out) = texts.push(text) {
+                                            emit_text(&mut stream, &out, content_index, &mut text_block_open);
+                                        }
                                     }
                                 }
                                 "tool_use" => {
+                                    // A tool block cannot open while text is still streaming.
+                                    if let Some(out) = texts.flush() {
+                                        emit_text(&mut stream, &out, content_index, &mut text_block_open);
+                                    }
+                                    if text_block_open {
+                                        let _ = write_sse(&mut stream, "content_block_stop", &serde_json::json!({
+                                            "type": "content_block_stop", "index": content_index
+                                        }));
+                                        text_block_open = false;
+                                        content_index += 1;
+                                    }
                                     let name = block["name"].as_str().unwrap_or("unknown");
                                     let input = block["input"].clone();
                                     let fallback_id = format!("toolu_{}", content_index);
@@ -472,8 +551,22 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                         }
                     }
                 }
+                Some("tool_call") => {
+                    if let Some(out) = texts.flush() {
+                        emit_text(&mut stream, &out, content_index, &mut text_block_open);
+                    }
+                }
                 Some("result") => {
                     result_received = true;
+                    if let Some(out) = texts.flush() {
+                        emit_text(&mut stream, &out, content_index, &mut text_block_open);
+                    }
+                    if text_block_open {
+                        let _ = write_sse(&mut stream, "content_block_stop", &serde_json::json!({
+                            "type": "content_block_stop", "index": content_index
+                        }));
+                        text_block_open = false;
+                    }
                     let usage = &event["usage"];
                     let _ = write_sse(&mut stream, "message_delta", &serde_json::json!({
                         "type": "message_delta",
@@ -487,6 +580,15 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                 _ => {}
             }
         }
+    }
+
+    if let Some(out) = texts.flush() {
+        emit_text(&mut stream, &out, content_index, &mut text_block_open);
+    }
+    if text_block_open {
+        let _ = write_sse(&mut stream, "content_block_stop", &serde_json::json!({
+            "type": "content_block_stop", "index": content_index
+        }));
     }
 
     if !result_received {
@@ -524,6 +626,56 @@ fn handle_messages(mut stream: TcpStream, body: &[u8], _token: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feeds a segment's events and returns the text a client would render.
+    fn render(segments: &[&[&str]]) -> String {
+        let mut ts = TextStream::new();
+        let mut out = String::new();
+        for seg in segments {
+            for ev in *seg {
+                if let Some(t) = ts.push(ev) { out.push_str(&t); }
+            }
+            if let Some(t) = ts.flush() { out.push_str(&t); }
+        }
+        out
+    }
+
+    #[test]
+    fn test_segment_recap_is_dropped() {
+        // Deltas, then the recap repeating the whole segment.
+        let out = render(&[&["I", "'ll run that", " command", " for you.",
+                             "I'll run that command for you."]]);
+        assert_eq!(out, "I'll run that command for you.");
+    }
+
+    #[test]
+    fn test_recap_dropped_in_every_segment_of_a_tool_turn() {
+        // Text, tool call, more text: each segment ends with its own recap,
+        // and the mid-turn recap is tagged exactly like a delta.
+        let out = render(&[
+            &["I", "'ll check.", "I'll check."],
+            &["The", " answer is 4.", "The answer is 4."],
+        ]);
+        assert_eq!(out, "I'll check.The answer is 4.");
+    }
+
+    #[test]
+    fn test_single_event_without_deltas_is_emitted() {
+        // An agent predating --stream-partial-output sends only the recap.
+        assert_eq!(render(&[&["the whole reply"]]), "the whole reply");
+    }
+
+    #[test]
+    fn test_repeated_text_is_not_mistaken_for_a_recap() {
+        // "hi" twice mid-segment is real output, not a recap: only the event
+        // that closes the segment is eligible to be dropped.
+        assert_eq!(render(&[&["hi", "hi", "hihi"]]), "hihi");
+    }
+
+    #[test]
+    fn test_empty_turn_produces_nothing() {
+        assert_eq!(render(&[&[]]), "");
+    }
 
     #[test]
     fn test_extract_system_text_string() {
