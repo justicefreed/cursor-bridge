@@ -439,9 +439,11 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                             match block_type {
                                 "text" => {
                                     if let Some(text) = block["text"].as_str() {
+                                        // Anthropic clients accumulate start.text + delta.text.
+                                        // Start must be empty; only the delta carries content.
                                         let _ = write_sse(&mut stream, "content_block_start", &serde_json::json!({
                                             "type": "content_block_start", "index": content_index,
-                                            "content_block": {"type": "text", "text": text}
+                                            "content_block": {"type": "text", "text": ""}
                                         }));
                                         let _ = write_sse(&mut stream, "content_block_delta", &serde_json::json!({
                                             "type": "content_block_delta", "index": content_index,
