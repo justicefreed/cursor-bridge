@@ -317,6 +317,14 @@ fn find_agent() -> Option<String> {
     None
 }
 
+/// True for the incremental `assistant` events produced by
+/// `--stream-partial-output`. Those carry a top-level `timestamp_ms`; the
+/// single recap event the agent sends afterwards, repeating the whole reply,
+/// does not. Agents predating the flag send only the untagged recap.
+fn is_partial_delta(event: &serde_json::Value) -> bool {
+    event.get("timestamp_ms").is_some()
+}
+
 fn spawn_agent(requested_model: &str) -> std::io::Result<std::process::Child> {
     let path = find_agent().unwrap_or_else(|| { log("agent not found. Install Cursor CLI or set AGENT_PATH."); std::process::exit(1); });
     log(&format!("spawning: {path}"));
@@ -330,7 +338,8 @@ fn spawn_agent(requested_model: &str) -> std::io::Result<std::process::Child> {
     // --force auto-approves tool calls in non-interactive mode.
     // --trust skips workspace trust prompt.
     Command::new(path)
-        .args(["--print", "--force", "--output-format", "stream-json", "--model", requested_model, "--trust"])
+        .args(["--print", "--force", "--output-format", "stream-json", "--stream-partial-output",
+               "--model", requested_model, "--trust"])
         .current_dir(&sandbox)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -361,7 +370,8 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
     write_prompt(&mut agent, &prompt);
 
     let reader = BufReader::new(agent.stdout.take().unwrap());
-    let mut text = String::new();
+    let mut delta_text = String::new();
+    let mut recap_text = String::new();
     let mut usage = serde_json::json!({});
 
     for line in reader.lines() {
@@ -369,9 +379,14 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
         if line.trim().is_empty() { continue; }
         if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
             if event["type"] == "assistant" {
+                // --stream-partial-output makes the agent send incremental
+                // deltas, each tagged with timestamp_ms, and then one untagged
+                // recap event repeating the whole reply. Summing both counts
+                // the answer twice.
+                let target = if is_partial_delta(&event) { &mut delta_text } else { &mut recap_text };
                 if let Some(arr) = event["message"]["content"].as_array() {
                     for block in arr {
-                        if let Some(t) = block["text"].as_str() { text.push_str(t); }
+                        if let Some(t) = block["text"].as_str() { target.push_str(t); }
                     }
                 }
             }
@@ -379,6 +394,10 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
         }
     }
     let _ = agent.wait();
+
+    // The recap is authoritative when present; the accumulated deltas cover
+    // agents old enough to not know --stream-partial-output.
+    let text = if recap_text.is_empty() { delta_text } else { recap_text };
 
     let resp = serde_json::json!({
         "id": format!("msg_{}", std::process::id()), "type": "message", "role": "assistant",
@@ -426,6 +445,9 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
     let reader = BufReader::new(agent.stdout.take().unwrap());
     let mut content_index = 0i32;
     let mut result_received = false;
+    // A run of text deltas belongs in one content block, not one block each.
+    let mut text_block_open = false;
+    let mut streamed_any_text = false;
 
     for line in reader.lines() {
         let line = match line { Ok(l) => l, _ => break };
@@ -433,29 +455,43 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
         if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
             match event["type"].as_str() {
                 Some("assistant") => {
+                    // Deltas carry timestamp_ms; the untagged recap event that
+                    // follows them repeats the entire reply. Forwarding both
+                    // would show the answer twice, so the recap is used only
+                    // as a fallback for agents that never sent deltas.
+                    if !is_partial_delta(&event) && streamed_any_text { continue; }
                     if let Some(blocks) = event["message"]["content"].as_array() {
                         for block in blocks {
                             let block_type = block["type"].as_str().unwrap_or("text");
                             match block_type {
                                 "text" => {
                                     if let Some(text) = block["text"].as_str() {
+                                        if text.is_empty() { continue; }
                                         // Anthropic clients accumulate start.text + delta.text.
-                                        // Start must be empty; only the delta carries content.
-                                        let _ = write_sse(&mut stream, "content_block_start", &serde_json::json!({
-                                            "type": "content_block_start", "index": content_index,
-                                            "content_block": {"type": "text", "text": ""}
-                                        }));
+                                        // Start must be empty; only deltas carry content.
+                                        if !text_block_open {
+                                            let _ = write_sse(&mut stream, "content_block_start", &serde_json::json!({
+                                                "type": "content_block_start", "index": content_index,
+                                                "content_block": {"type": "text", "text": ""}
+                                            }));
+                                            text_block_open = true;
+                                        }
                                         let _ = write_sse(&mut stream, "content_block_delta", &serde_json::json!({
                                             "type": "content_block_delta", "index": content_index,
                                             "delta": {"type": "text_delta", "text": text}
                                         }));
-                                        let _ = write_sse(&mut stream, "content_block_stop", &serde_json::json!({
-                                            "type": "content_block_stop", "index": content_index
-                                        }));
-                                        content_index += 1;
+                                        streamed_any_text = true;
                                     }
                                 }
                                 "tool_use" => {
+                                    // A tool block cannot open while text is still streaming.
+                                    if text_block_open {
+                                        let _ = write_sse(&mut stream, "content_block_stop", &serde_json::json!({
+                                            "type": "content_block_stop", "index": content_index
+                                        }));
+                                        text_block_open = false;
+                                        content_index += 1;
+                                    }
                                     let name = block["name"].as_str().unwrap_or("unknown");
                                     let input = block["input"].clone();
                                     let fallback_id = format!("toolu_{}", content_index);
@@ -476,6 +512,12 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                 }
                 Some("result") => {
                     result_received = true;
+                    if text_block_open {
+                        let _ = write_sse(&mut stream, "content_block_stop", &serde_json::json!({
+                            "type": "content_block_stop", "index": content_index
+                        }));
+                        text_block_open = false;
+                    }
                     let usage = &event["usage"];
                     let _ = write_sse(&mut stream, "message_delta", &serde_json::json!({
                         "type": "message_delta",
@@ -489,6 +531,12 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                 _ => {}
             }
         }
+    }
+
+    if text_block_open {
+        let _ = write_sse(&mut stream, "content_block_stop", &serde_json::json!({
+            "type": "content_block_stop", "index": content_index
+        }));
     }
 
     if !result_received {
@@ -526,6 +574,25 @@ fn handle_messages(mut stream: TcpStream, body: &[u8], _token: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_partial_delta_is_tagged_with_timestamp() {
+        let delta = serde_json::json!({
+            "type": "assistant", "session_id": "s1", "timestamp_ms": 1789061316075u64,
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "1"}]}
+        });
+        assert!(is_partial_delta(&delta));
+    }
+
+    #[test]
+    fn test_recap_event_is_not_a_delta() {
+        // The final event the agent sends after the deltas: same shape, no timestamp_ms.
+        let recap = serde_json::json!({
+            "type": "assistant", "session_id": "s1",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "1\n2\n3"}]}
+        });
+        assert!(!is_partial_delta(&recap));
+    }
 
     #[test]
     fn test_extract_system_text_string() {
