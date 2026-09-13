@@ -2,7 +2,7 @@
 // One binary. Zero config.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -660,7 +660,7 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
 
 // ─── Streaming ────────────────────────────────────────────────
 
-fn write_sse(stream: &mut TcpStream, event_type: &str, data: &serde_json::Value) -> std::io::Result<()> {
+fn write_sse<W: Write>(stream: &mut W, event_type: &str, data: &serde_json::Value) -> std::io::Result<()> {
     let json = serde_json::to_string(data)?;
     stream.write_all(b"event: ")?;
     stream.write_all(event_type.as_bytes())?;
@@ -673,7 +673,7 @@ fn write_sse(stream: &mut TcpStream, event_type: &str, data: &serde_json::Value)
 /// Appends text to the open block, opening one first if needed. Anthropic
 /// clients accumulate `content_block_start.text` plus every delta, so the
 /// start must be empty and only deltas may carry content.
-fn emit_text(stream: &mut TcpStream, text: &str, index: i32, block_open: &mut bool) {
+fn emit_text<W: Write>(stream: &mut W, text: &str, index: i32, block_open: &mut bool) {
     if text.is_empty() { return; }
     if !*block_open {
         let _ = write_sse(stream, "content_block_start", &serde_json::json!({
@@ -686,6 +686,133 @@ fn emit_text(stream: &mut TcpStream, text: &str, index: i32, block_open: &mut bo
         "type": "content_block_delta", "index": index,
         "delta": {"type": "text_delta", "text": text}
     }));
+}
+
+fn close_text_block<W: Write>(stream: &mut W, index: i32, block_open: &mut bool) -> bool {
+    if !*block_open { return false; }
+    let _ = write_sse(stream, "content_block_stop", &serde_json::json!({
+        "type": "content_block_stop", "index": index
+    }));
+    *block_open = false;
+    true
+}
+
+fn emit_tool_use<W: Write>(
+    stream: &mut W,
+    index: i32,
+    tool_id: &str,
+    name: &str,
+    input: serde_json::Value,
+) {
+    let _ = write_sse(stream, "content_block_start", &serde_json::json!({
+        "type": "content_block_start", "index": index,
+        "content_block": {"type": "tool_use", "id": tool_id, "name": name, "input": input}
+    }));
+    let _ = write_sse(stream, "content_block_stop", &serde_json::json!({
+        "type": "content_block_stop", "index": index
+    }));
+}
+
+fn str_field<'a>(event: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    for key in keys {
+        if let Some(value) = event.get(*key).and_then(|v| v.as_str()) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn nested_str_field<'a>(
+    event: &'a serde_json::Value,
+    parent_keys: &[&str],
+    child_keys: &[&str],
+) -> Option<&'a str> {
+    for parent in parent_keys {
+        if let Some(obj) = event.get(*parent) {
+            if let Some(value) = str_field(obj, child_keys) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn tool_call_id(event: &serde_json::Value, index: i32) -> String {
+    str_field(event, &["id", "call_id", "tool_call_id"])
+        .or_else(|| nested_str_field(event, &["tool_call", "toolCall"], &["id", "call_id", "tool_call_id"]))
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("toolu_{index}"))
+}
+
+fn tool_call_name(event: &serde_json::Value) -> Option<&str> {
+    str_field(event, &["name", "tool_name"])
+        .or_else(|| nested_str_field(event, &["tool_call", "toolCall"], &["name", "tool_name"]))
+}
+
+fn object_or_wrapped_input(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(_) => value.clone(),
+        serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s)
+            .ok()
+            .filter(|parsed| parsed.is_object())
+            .unwrap_or_else(|| serde_json::json!({ "input": s })),
+        serde_json::Value::Null => serde_json::json!({}),
+        _ => serde_json::json!({ "input": value }),
+    }
+}
+
+fn tool_call_input(event: &serde_json::Value) -> serde_json::Value {
+    for key in &["input", "args", "arguments"] {
+        if let Some(value) = event.get(*key) {
+            return object_or_wrapped_input(value);
+        }
+    }
+    for parent in &["tool_call", "toolCall"] {
+        if let Some(obj) = event.get(*parent) {
+            for key in &["input", "args", "arguments"] {
+                if let Some(value) = obj.get(*key) {
+                    return object_or_wrapped_input(value);
+                }
+            }
+        }
+    }
+    serde_json::json!({})
+}
+
+fn tool_call_is_completion(event: &serde_json::Value) -> bool {
+    for key in &["subtype", "status", "phase"] {
+        if let Some(value) = event.get(*key).and_then(|v| v.as_str()) {
+            let lower = value.to_ascii_lowercase();
+            if lower.contains("start") { return false; }
+            if lower.contains("complete")
+                || lower.contains("finish")
+                || lower.contains("success")
+                || lower.contains("error")
+                || lower.contains("fail")
+                || lower.contains("result")
+            {
+                return true;
+            }
+        }
+    }
+    (event.get("output").is_some() || event.get("result").is_some())
+        && event.get("input").is_none()
+        && event.get("args").is_none()
+        && event.get("arguments").is_none()
+}
+
+fn emit_tool_call<W: Write>(
+    stream: &mut W,
+    event: &serde_json::Value,
+    index: i32,
+    seen_tool_ids: &mut HashSet<String>,
+) -> bool {
+    if tool_call_is_completion(event) { return false; }
+    let Some(name) = tool_call_name(event) else { return false; };
+    let tool_id = tool_call_id(event, index);
+    if !seen_tool_ids.insert(tool_id.clone()) { return false; }
+    emit_tool_use(stream, index, &tool_id, name, tool_call_input(event));
+    true
 }
 
 fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
@@ -721,6 +848,7 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
     let mut text_block_open = false;
     let mut texts = TextStream::new();
     let mut chat_id = String::new();
+    let mut seen_tool_ids = HashSet::new();
 
     for line in reader.lines() {
         let line = match line { Ok(l) => l, _ => break };
@@ -747,24 +875,15 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                                     if let Some(out) = texts.flush() {
                                         emit_text(&mut stream, &out, content_index, &mut text_block_open);
                                     }
-                                    if text_block_open {
-                                        let _ = write_sse(&mut stream, "content_block_stop", &serde_json::json!({
-                                            "type": "content_block_stop", "index": content_index
-                                        }));
-                                        text_block_open = false;
+                                    if close_text_block(&mut stream, content_index, &mut text_block_open) {
                                         content_index += 1;
                                     }
                                     let name = block["name"].as_str().unwrap_or("unknown");
                                     let input = block["input"].clone();
                                     let fallback_id = format!("toolu_{}", content_index);
                                     let tool_id = block["id"].as_str().unwrap_or(&fallback_id);
-                                    let _ = write_sse(&mut stream, "content_block_start", &serde_json::json!({
-                                        "type": "content_block_start", "index": content_index,
-                                        "content_block": {"type": "tool_use", "id": tool_id, "name": name, "input": input}
-                                    }));
-                                    let _ = write_sse(&mut stream, "content_block_stop", &serde_json::json!({
-                                        "type": "content_block_stop", "index": content_index
-                                    }));
+                                    seen_tool_ids.insert(tool_id.to_string());
+                                    emit_tool_use(&mut stream, content_index, tool_id, name, input);
                                     content_index += 1;
                                 }
                                 _ => {} // skip thinking, etc
@@ -779,6 +898,12 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                     if let Some(out) = texts.flush() {
                         emit_text(&mut stream, &out, content_index, &mut text_block_open);
                     }
+                    if close_text_block(&mut stream, content_index, &mut text_block_open) {
+                        content_index += 1;
+                    }
+                    if emit_tool_call(&mut stream, &event, content_index, &mut seen_tool_ids) {
+                        content_index += 1;
+                    }
                 }
                 Some("result") => {
                     result_received = true;
@@ -788,12 +913,7 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                     if let Some(out) = texts.flush() {
                         emit_text(&mut stream, &out, content_index, &mut text_block_open);
                     }
-                    if text_block_open {
-                        let _ = write_sse(&mut stream, "content_block_stop", &serde_json::json!({
-                            "type": "content_block_stop", "index": content_index
-                        }));
-                        text_block_open = false;
-                    }
+                    close_text_block(&mut stream, content_index, &mut text_block_open);
                     let usage = &event["usage"];
                     let _ = write_sse(&mut stream, "message_delta", &serde_json::json!({
                         "type": "message_delta",
@@ -812,11 +932,7 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
     if let Some(out) = texts.flush() {
         emit_text(&mut stream, &out, content_index, &mut text_block_open);
     }
-    if text_block_open {
-        let _ = write_sse(&mut stream, "content_block_stop", &serde_json::json!({
-            "type": "content_block_stop", "index": content_index
-        }));
-    }
+    close_text_block(&mut stream, content_index, &mut text_block_open);
 
     if !result_received {
         log("result not received, sending fallback message_stop");
@@ -869,6 +985,15 @@ mod tests {
 
     fn msg(role: &str, text: &str) -> Message {
         Message { role: role.into(), content: serde_json::Value::String(text.into()) }
+    }
+
+    fn sse_payloads(bytes: &[u8]) -> Vec<serde_json::Value> {
+        let stream = String::from_utf8(bytes.to_vec()).unwrap();
+        stream
+            .split("\n\n")
+            .filter_map(|event| event.lines().find_map(|line| line.strip_prefix("data: ")))
+            .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+            .collect()
     }
 
     /// Serve a turn and record its session, the way a handler does.
@@ -1085,6 +1210,77 @@ mod tests {
     #[test]
     fn test_empty_turn_produces_nothing() {
         assert_eq!(render(&[&[]]), "");
+    }
+
+    #[test]
+    fn test_top_level_tool_call_emits_anthropic_tool_block() {
+        let event = serde_json::json!({
+            "type": "tool_call",
+            "id": "call_1",
+            "name": "shell",
+            "input": {"command": "pwd"}
+        });
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+
+        assert!(emit_tool_call(&mut out, &event, 2, &mut seen));
+
+        let payloads = sse_payloads(&out);
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0]["type"], "content_block_start");
+        assert_eq!(payloads[0]["index"], 2);
+        assert_eq!(payloads[0]["content_block"]["type"], "tool_use");
+        assert_eq!(payloads[0]["content_block"]["id"], "call_1");
+        assert_eq!(payloads[0]["content_block"]["name"], "shell");
+        assert_eq!(payloads[0]["content_block"]["input"]["command"], "pwd");
+        assert_eq!(payloads[1]["type"], "content_block_stop");
+    }
+
+    #[test]
+    fn test_nested_tool_call_shape_is_supported() {
+        let event = serde_json::json!({
+            "type": "tool_call",
+            "tool_call": {
+                "call_id": "call_2",
+                "tool_name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            }
+        });
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+
+        assert!(emit_tool_call(&mut out, &event, 0, &mut seen));
+
+        let payloads = sse_payloads(&out);
+        assert_eq!(payloads[0]["content_block"]["id"], "call_2");
+        assert_eq!(payloads[0]["content_block"]["name"], "read_file");
+        assert_eq!(payloads[0]["content_block"]["input"]["path"], "README.md");
+    }
+
+    #[test]
+    fn test_tool_call_completion_and_duplicate_are_not_reemitted() {
+        let start = serde_json::json!({
+            "type": "tool_call",
+            "id": "call_1",
+            "name": "shell",
+            "input": {"command": "pwd"}
+        });
+        let done = serde_json::json!({
+            "type": "tool_call",
+            "id": "call_1",
+            "name": "shell",
+            "status": "completed",
+            "output": "/tmp"
+        });
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+
+        assert!(emit_tool_call(&mut out, &start, 0, &mut seen));
+        assert!(!emit_tool_call(&mut out, &start, 1, &mut seen));
+        assert!(!emit_tool_call(&mut out, &done, 1, &mut seen));
+
+        let payloads = sse_payloads(&out);
+        assert_eq!(payloads.len(), 2);
     }
 
     #[test]
