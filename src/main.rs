@@ -77,6 +77,7 @@ fn main() {
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+<<<<<<< HEAD
 fn active_agent_groups() -> &'static Mutex<HashSet<i32>> {
     static GROUPS: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
     GROUPS.get_or_init(|| Mutex::new(HashSet::new()))
@@ -104,6 +105,14 @@ fn terminate_active_agents() {
         terminate_process_group(pgid);
     }
 }
+=======
+extern "C" {
+    fn signal(signum: i32, handler: usize) -> usize;
+}
+
+const SIGINT: i32 = 2;
+const SIGTERM: i32 = 15;
+>>>>>>> 559e70b (cursor bridge: reuse sandbox and disable context-mode)
 
 extern "C" fn request_shutdown(_sig: i32) {
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
@@ -115,12 +124,20 @@ extern "C" fn request_shutdown(_sig: i32) {
 /// actual cleanup and exit.
 fn install_signal_handlers() {
     unsafe {
+<<<<<<< HEAD
         libc::signal(libc::SIGINT, request_shutdown as libc::sighandler_t);
         libc::signal(libc::SIGTERM, request_shutdown as libc::sighandler_t);
     }
     std::thread::Builder::new().name("bridge-shutdown".into()).spawn(|| loop {
         if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
             terminate_active_agents();
+=======
+        signal(SIGINT, request_shutdown as *const () as usize);
+        signal(SIGTERM, request_shutdown as *const () as usize);
+    }
+    std::thread::Builder::new().name("bridge-shutdown".into()).spawn(|| loop {
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+>>>>>>> 559e70b (cursor bridge: reuse sandbox and disable context-mode)
             cleanup_sandbox();
             std::process::exit(130);
         }
