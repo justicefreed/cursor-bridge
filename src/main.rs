@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,7 +78,6 @@ fn main() {
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-<<<<<<< HEAD
 fn active_agent_groups() -> &'static Mutex<HashSet<i32>> {
     static GROUPS: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
     GROUPS.get_or_init(|| Mutex::new(HashSet::new()))
@@ -96,6 +96,18 @@ fn terminate_process_group(pgid: i32) {
     }
 }
 
+/// Stops an active request and reaps its direct child. Its descendants share
+/// the child process group, so they receive the same signals.
+fn stop_and_reap_agent(agent: &mut std::process::Child) {
+    let pgid = agent.id() as i32;
+    unregister_agent_group(pgid);
+    // The CLI may exit before a worker-server or language-server descendant.
+    // The dedicated group is unique to this request, so stop it even when the
+    // direct child has already reported completion.
+    terminate_process_group(pgid);
+    let _ = agent.wait();
+}
+
 fn terminate_active_agents() {
     let groups = active_agent_groups()
         .lock()
@@ -105,14 +117,18 @@ fn terminate_active_agents() {
         terminate_process_group(pgid);
     }
 }
-=======
-extern "C" {
-    fn signal(signum: i32, handler: usize) -> usize;
+
+fn register_agent_group(pgid: i32) {
+    if let Ok(mut groups) = active_agent_groups().lock() {
+        groups.insert(pgid);
+    }
 }
 
-const SIGINT: i32 = 2;
-const SIGTERM: i32 = 15;
->>>>>>> 559e70b (cursor bridge: reuse sandbox and disable context-mode)
+fn unregister_agent_group(pgid: i32) {
+    if let Ok(mut groups) = active_agent_groups().lock() {
+        groups.remove(&pgid);
+    }
+}
 
 extern "C" fn request_shutdown(_sig: i32) {
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
@@ -124,20 +140,12 @@ extern "C" fn request_shutdown(_sig: i32) {
 /// actual cleanup and exit.
 fn install_signal_handlers() {
     unsafe {
-<<<<<<< HEAD
-        libc::signal(libc::SIGINT, request_shutdown as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, request_shutdown as libc::sighandler_t);
+        libc::signal(libc::SIGINT, request_shutdown as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, request_shutdown as *const () as libc::sighandler_t);
     }
     std::thread::Builder::new().name("bridge-shutdown".into()).spawn(|| loop {
         if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
             terminate_active_agents();
-=======
-        signal(SIGINT, request_shutdown as *const () as usize);
-        signal(SIGTERM, request_shutdown as *const () as usize);
-    }
-    std::thread::Builder::new().name("bridge-shutdown".into()).spawn(|| loop {
-        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
->>>>>>> 559e70b (cursor bridge: reuse sandbox and disable context-mode)
             cleanup_sandbox();
             std::process::exit(130);
         }
@@ -699,8 +707,21 @@ fn spawn_agent(requested_model: &str, resume: Option<&str>) -> std::io::Result<s
     cmd.current_dir(sandbox)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+        .stderr(Stdio::null());
+    // Cursor launches worker-server, npm, and language-server descendants.
+    // Giving the CLI its own group lets cancellation reliably target the
+    // entire per-request tree instead of leaving those descendants behind.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn()?;
+    register_agent_group(child.id() as i32);
+    Ok(child)
 }
 
 fn write_prompt(agent: &mut std::process::Child, prompt: &str) {
@@ -762,7 +783,7 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
             }
         }
     }
-    let _ = agent.wait();
+    stop_and_reap_agent(&mut agent);
     if let Some(out) = texts.flush() { text.push_str(&out); }
 
     // Only a completed turn may be resumed; a failed one leaves the session
@@ -810,7 +831,6 @@ fn emit_text<W: Write>(stream: &mut W, text: &str, index: i32, block_open: &mut 
     }));
 }
 
-<<<<<<< HEAD
 /// Emits a complete private reasoning block. Cursor's stream-json protocol
 /// delivers reasoning as a completed assistant content block, unlike text
 /// which arrives incrementally and needs recap suppression.
@@ -833,8 +853,6 @@ fn emit_thinking<W: Write>(stream: &mut W, thinking: &str, index: i32) {
     }));
 }
 
-=======
->>>>>>> main
 fn close_text_block<W: Write>(stream: &mut W, index: i32, block_open: &mut bool) -> bool {
     if !*block_open { return false; }
     let _ = write_sse(stream, "content_block_stop", &serde_json::json!({
@@ -1104,7 +1122,7 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
         let _ = stream.flush();
     }
 
-    let _ = agent.wait();
+    stop_and_reap_agent(&mut agent);
 }
 
 fn handle_messages(mut stream: TcpStream, body: &[u8], _token: &str) {
@@ -1443,7 +1461,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn test_thinking_is_emitted_as_a_private_reasoning_block() {
         let mut out = Vec::new();
 
@@ -1462,8 +1479,6 @@ mod tests {
     }
 
     #[test]
-=======
->>>>>>> main
     fn test_extract_system_text_string() {
         let v = Some(serde_json::Value::String("Be helpful.".into()));
         assert_eq!(extract_system_text(&v), "Be helpful.");
