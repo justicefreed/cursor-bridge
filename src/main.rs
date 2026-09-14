@@ -688,6 +688,28 @@ fn emit_text<W: Write>(stream: &mut W, text: &str, index: i32, block_open: &mut 
     }));
 }
 
+/// Emits a complete private reasoning block. Cursor's stream-json protocol
+/// delivers reasoning as a completed assistant content block, unlike text
+/// which arrives incrementally and needs recap suppression.
+///
+/// Do not translate this into `text_delta`: Claude Code recognizes the
+/// `thinking` block type and Paseo can render it as collapsed reasoning rather
+/// than as user-facing assistant output.
+fn emit_thinking<W: Write>(stream: &mut W, thinking: &str, index: i32) {
+    if thinking.is_empty() { return; }
+    let _ = write_sse(stream, "content_block_start", &serde_json::json!({
+        "type": "content_block_start", "index": index,
+        "content_block": {"type": "thinking", "thinking": ""}
+    }));
+    let _ = write_sse(stream, "content_block_delta", &serde_json::json!({
+        "type": "content_block_delta", "index": index,
+        "delta": {"type": "thinking_delta", "thinking": thinking}
+    }));
+    let _ = write_sse(stream, "content_block_stop", &serde_json::json!({
+        "type": "content_block_stop", "index": index
+    }));
+}
+
 fn close_text_block<W: Write>(stream: &mut W, index: i32, block_open: &mut bool) -> bool {
     if !*block_open { return false; }
     let _ = write_sse(stream, "content_block_stop", &serde_json::json!({
@@ -886,7 +908,19 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                                     emit_tool_use(&mut stream, content_index, tool_id, name, input);
                                     content_index += 1;
                                 }
-                                _ => {} // skip thinking, etc
+                                "thinking" => {
+                                    if let Some(thinking) = block["thinking"].as_str() {
+                                        if let Some(out) = texts.flush() {
+                                            emit_text(&mut stream, &out, content_index, &mut text_block_open);
+                                        }
+                                        if close_text_block(&mut stream, content_index, &mut text_block_open) {
+                                            content_index += 1;
+                                        }
+                                        emit_thinking(&mut stream, thinking, content_index);
+                                        content_index += 1;
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -1281,6 +1315,24 @@ mod tests {
 
         let payloads = sse_payloads(&out);
         assert_eq!(payloads.len(), 2);
+    }
+
+    #[test]
+    fn test_thinking_is_emitted_as_a_private_reasoning_block() {
+        let mut out = Vec::new();
+
+        emit_thinking(&mut out, "I should inspect the stream shape.", 3);
+
+        let payloads = sse_payloads(&out);
+        assert_eq!(payloads.len(), 3);
+        assert_eq!(payloads[0]["type"], "content_block_start");
+        assert_eq!(payloads[0]["index"], 3);
+        assert_eq!(payloads[0]["content_block"]["type"], "thinking");
+        assert_eq!(payloads[0]["content_block"]["thinking"], "");
+        assert_eq!(payloads[1]["type"], "content_block_delta");
+        assert_eq!(payloads[1]["delta"]["type"], "thinking_delta");
+        assert_eq!(payloads[1]["delta"]["thinking"], "I should inspect the stream shape.");
+        assert_eq!(payloads[2]["type"], "content_block_stop");
     }
 
     #[test]
