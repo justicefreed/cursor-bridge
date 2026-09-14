@@ -40,21 +40,33 @@ fn main() {
         log("No Cursor token found. Run `agent login` first.");
         std::process::exit(1);
     }
-    log(&format!("token: {}..{}", &token[..12], &token[token.len()-4..]));
+    log(&format!(
+        "token: {}..{}",
+        &token[..12],
+        &token[token.len() - 4..]
+    ));
 
     let proxy = match Proxy::start(&token) {
         Ok(p) => p,
-        Err(err) => { log(&format!("proxy failed: {err}")); std::process::exit(1); }
+        Err(err) => {
+            log(&format!("proxy failed: {err}"));
+            std::process::exit(1);
+        }
     };
 
     let mut cmd = Command::new("claude");
-    cmd.env("ANTHROPIC_BASE_URL", format!("http://127.0.0.1:{}", proxy.port()));
+    cmd.env(
+        "ANTHROPIC_BASE_URL",
+        format!("http://127.0.0.1:{}", proxy.port()),
+    );
     cmd.env("ANTHROPIC_AUTH_TOKEN", "sk-any");
     cmd.env("ANTHROPIC_API_KEY", "");
     cmd.env("ANTHROPIC_MODEL", "cursor-auto");
     cmd.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
 
-    for arg in &claude_args { cmd.arg(arg); }
+    for arg in &claude_args {
+        cmd.arg(arg);
+    }
     cmd.stdin(Stdio::inherit());
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
@@ -140,17 +152,26 @@ extern "C" fn request_shutdown(_sig: i32) {
 /// actual cleanup and exit.
 fn install_signal_handlers() {
     unsafe {
-        libc::signal(libc::SIGINT, request_shutdown as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, request_shutdown as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            request_shutdown as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            request_shutdown as *const () as libc::sighandler_t,
+        );
     }
-    std::thread::Builder::new().name("bridge-shutdown".into()).spawn(|| loop {
-        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
-            terminate_active_agents();
-            cleanup_sandbox();
-            std::process::exit(130);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }).ok();
+    std::thread::Builder::new()
+        .name("bridge-shutdown".into())
+        .spawn(|| loop {
+            if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+                terminate_active_agents();
+                cleanup_sandbox();
+                std::process::exit(130);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        })
+        .ok();
 }
 
 // ─── Token ────────────────────────────────────────────────────
@@ -158,7 +179,9 @@ fn install_signal_handlers() {
 fn get_cursor_token() -> String {
     for var in &["CURSOR_TOKEN", "CURSOR_API_KEY"] {
         if let Ok(t) = std::env::var(var) {
-            if !t.is_empty() { return t; }
+            if !t.is_empty() {
+                return t;
+            }
         }
     }
     let out = Command::new("security")
@@ -172,7 +195,10 @@ fn get_cursor_token() -> String {
 
 // ─── Proxy ────────────────────────────────────────────────────
 
-struct Proxy { port: u16, _shutdown: Arc<AtomicBool> }
+struct Proxy {
+    port: u16,
+    _shutdown: Arc<AtomicBool>,
+}
 
 impl Proxy {
     fn start(token: &str) -> std::io::Result<Self> {
@@ -182,28 +208,41 @@ impl Proxy {
         let shutdown = Arc::new(AtomicBool::new(false));
         let sd = shutdown.clone();
 
-        std::thread::Builder::new().name("bridge-proxy".into()).spawn(move || {
-            let _ = listener.set_nonblocking(true);
-            loop {
-                if sd.load(Ordering::Relaxed) { break; }
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        let ct = t.clone();
-                        std::thread::Builder::new().name("bridge-conn".into())
-                            .spawn(move || handle_connection(stream, &ct)).ok();
+        std::thread::Builder::new()
+            .name("bridge-proxy".into())
+            .spawn(move || {
+                let _ = listener.set_nonblocking(true);
+                loop {
+                    if sd.load(Ordering::Relaxed) {
+                        break;
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock =>
-                        std::thread::sleep(Duration::from_millis(50)),
-                    Err(_) => break,
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let ct = t.clone();
+                            std::thread::Builder::new()
+                                .name("bridge-conn".into())
+                                .spawn(move || handle_connection(stream, &ct))
+                                .ok();
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(50))
+                        }
+                        Err(_) => break,
+                    }
                 }
-            }
-        }).ok();
+            })
+            .ok();
 
         log(&format!("proxy on 127.0.0.1:{port}"));
-        Ok(Self { port, _shutdown: shutdown })
+        Ok(Self {
+            port,
+            _shutdown: shutdown,
+        })
     }
 
-    fn port(&self) -> u16 { self.port }
+    fn port(&self) -> u16 {
+        self.port
+    }
 }
 
 // ─── HTTP ─────────────────────────────────────────────────────
@@ -211,12 +250,19 @@ impl Proxy {
 fn handle_connection(stream: TcpStream, token: &str) {
     let mut reader = BufReader::new(&stream);
     let mut req_line = String::new();
-    if reader.read_line(&mut req_line).ok().map_or(true, |n| n == 0) || req_line.trim().is_empty() {
+    if reader
+        .read_line(&mut req_line)
+        .ok()
+        .map_or(true, |n| n == 0)
+        || req_line.trim().is_empty()
+    {
         return;
     }
 
     let parts: Vec<&str> = req_line.trim().splitn(3, ' ').collect();
-    if parts.len() < 2 { return; }
+    if parts.len() < 2 {
+        return;
+    }
     let method = parts[0];
     let path = parts[1];
 
@@ -224,10 +270,16 @@ fn handle_connection(stream: TcpStream, token: &str) {
     let mut is_chunked = false;
     loop {
         let mut line = String::new();
-        if reader.read_line(&mut line).ok().map_or(true, |n| n == 0) || line.trim().is_empty() { break; }
+        if reader.read_line(&mut line).ok().map_or(true, |n| n == 0) || line.trim().is_empty() {
+            break;
+        }
         let lower = line.to_lowercase();
         if lower.starts_with("content-length:") {
-            content_length = line.split(':').nth(1).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            content_length = line
+                .split(':')
+                .nth(1)
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
         }
         if lower.contains("transfer-encoding:") && lower.contains("chunked") {
             is_chunked = true;
@@ -241,11 +293,15 @@ fn handle_connection(stream: TcpStream, token: &str) {
     } else if is_chunked {
         loop {
             let mut line = String::new();
-            if reader.read_line(&mut line).ok().map_or(true, |n| n == 0) { break; }
+            if reader.read_line(&mut line).ok().map_or(true, |n| n == 0) {
+                break;
+            }
             // Chunk size — strip extensions after ';'
             let size_str = line.split(';').next().unwrap_or("").trim();
             let sz = usize::from_str_radix(size_str, 16).unwrap_or(0);
-            if sz == 0 { break; }
+            if sz == 0 {
+                break;
+            }
             let mut chunk = vec![0u8; sz];
             let _ = reader.read_exact(&mut chunk);
             body.extend_from_slice(&chunk);
@@ -258,15 +314,20 @@ fn handle_connection(stream: TcpStream, token: &str) {
     match (method, path) {
         ("HEAD", "/api/hello") | ("GET", "/api/hello") => respond_hello(stream, method == "HEAD"),
         ("GET", "/v1/models") | ("GET", "/models") => respond_models(stream),
-        ("POST", p) if p.starts_with("/v1/messages") || p.starts_with("/messages") =>
-            handle_messages(stream, &body, token),
+        ("POST", p) if p.starts_with("/v1/messages") || p.starts_with("/messages") => {
+            handle_messages(stream, &body, token)
+        }
         ("OPTIONS", _) => respond_cors(stream),
         _ => respond_404(stream),
     }
 }
 
-fn respond_cors(mut s: TcpStream) { let _ = s.write_all(b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nContent-Length: 0\r\n\r\n"); }
-fn respond_404(mut s: TcpStream) { let _ = s.write_all(b"HTTP/1.1 404\r\nContent-Length: 2\r\n\r\n{}"); }
+fn respond_cors(mut s: TcpStream) {
+    let _ = s.write_all(b"HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\nContent-Length: 0\r\n\r\n");
+}
+fn respond_404(mut s: TcpStream) {
+    let _ = s.write_all(b"HTTP/1.1 404\r\nContent-Length: 2\r\n\r\n{}");
+}
 fn respond_hello(mut s: TcpStream, head: bool) {
     let b = r#"{"status":"ok"}"#;
     let h = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nx-request-id: bridge-{}\r\n\r\n{}", b.len(), std::process::id(), if head { "" } else { b });
@@ -274,7 +335,11 @@ fn respond_hello(mut s: TcpStream, head: bool) {
 }
 fn respond_models(mut s: TcpStream) {
     let body = get_models_json();
-    let h = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+    let h = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
     let _ = s.write_all(h.as_bytes());
 }
 
@@ -412,7 +477,9 @@ fn prefix_hash(turns: &[Turn], upto: usize) -> u64 {
     for (i, turn) in turns.iter().take(upto).enumerate() {
         i.hash(&mut h);
         turn.role.hash(&mut h);
-        if turn.role != "assistant" { turn.text.hash(&mut h); }
+        if turn.role != "assistant" {
+            turn.text.hash(&mut h);
+        }
     }
     h.finish()
 }
@@ -437,15 +504,23 @@ fn plan_turn(
     system: &Option<serde_json::Value>,
     model: &str,
 ) -> TurnPlan {
-    let fresh = || TurnPlan::Fresh { prompt: build_prompt(messages, system) };
+    let fresh = || TurnPlan::Fresh {
+        prompt: build_prompt(messages, system),
+    };
     let turns = conversation(messages);
-    if turns.is_empty() || resume_disabled() { return fresh(); }
+    if turns.is_empty() || resume_disabled() {
+        return fresh();
+    }
 
     let key = conversation_key(&turns);
     let entry = match store.get(&key) {
         Some(e) => e,
         None => {
-            log(&format!("no session for key {key:x} ({} known, {} turns)", store.len(), turns.len()));
+            log(&format!(
+                "no session for key {key:x} ({} known, {} turns)",
+                store.len(),
+                turns.len()
+            ));
             return fresh();
         }
     };
@@ -457,10 +532,16 @@ fn plan_turn(
         "history shorter than what we served"
     } else if prefix_hash(&turns, entry.verify_len) != entry.verify_hash {
         "prefix changed"
-    } else { "" };
+    } else {
+        ""
+    };
     if !reason.is_empty() {
-        log(&format!("fresh session ({reason}); consumed={} verify_len={} turns={}",
-                     entry.consumed, entry.verify_len, turns.len()));
+        log(&format!(
+            "fresh session ({reason}); consumed={} verify_len={} turns={}",
+            entry.consumed,
+            entry.verify_len,
+            turns.len()
+        ));
         return fresh();
     }
 
@@ -483,22 +564,32 @@ fn commit_session(
 ) {
     let turns = conversation(messages);
     if turns.is_empty() || chat_id.is_empty() {
-        log(&format!("not recording session (chat_id {chat_id:?}, {} turns)", turns.len()));
+        log(&format!(
+            "not recording session (chat_id {chat_id:?}, {} turns)",
+            turns.len()
+        ));
         return;
     }
     // Bound the map; conversations are cheap to re-open if evicted.
-    if store.len() >= 128 { store.clear(); }
+    if store.len() >= 128 {
+        store.clear();
+    }
     let verify_len = turns.len();
     let key = conversation_key(&turns);
-    log(&format!("recording session {chat_id} key {key:x} after {verify_len} turns"));
-    store.insert(key, SessionEntry {
-        chat_id: chat_id.to_string(),
-        // +1 for the reply this turn produced, which the next request echoes back.
-        consumed: verify_len + 1,
-        verify_len,
-        verify_hash: prefix_hash(&turns, verify_len),
-        model: model.to_string(),
-    });
+    log(&format!(
+        "recording session {chat_id} key {key:x} after {verify_len} turns"
+    ));
+    store.insert(
+        key,
+        SessionEntry {
+            chat_id: chat_id.to_string(),
+            // +1 for the reply this turn produced, which the next request echoes back.
+            consumed: verify_len + 1,
+            verify_len,
+            verify_hash: prefix_hash(&turns, verify_len),
+            model: model.to_string(),
+        },
+    );
 }
 
 // ─── Prompt building ──────────────────────────────────────────
@@ -511,7 +602,10 @@ fn extract_text(value: &serde_json::Value) -> String {
             for block in arr {
                 match block["type"].as_str() {
                     Some("text") => {
-                        if let Some(t) = block["text"].as_str() { out.push_str(t); out.push('\n'); }
+                        if let Some(t) = block["text"].as_str() {
+                            out.push_str(t);
+                            out.push('\n');
+                        }
                     }
                     Some("tool_use") => {
                         let name = block["name"].as_str().unwrap_or("unknown");
@@ -523,13 +617,19 @@ fn extract_text(value: &serde_json::Value) -> String {
                         let content = extract_text(&block["content"]);
                         let error = block["is_error"].as_bool().unwrap_or(false);
                         if error {
-                            out.push_str(&format!("[TOOL_ERROR: {id}]\n{content}\n[/TOOL_ERROR]\n"));
+                            out.push_str(&format!(
+                                "[TOOL_ERROR: {id}]\n{content}\n[/TOOL_ERROR]\n"
+                            ));
                         } else {
-                            out.push_str(&format!("[TOOL_RESULT: {id}]\n{content}\n[/TOOL_RESULT]\n"));
+                            out.push_str(&format!(
+                                "[TOOL_RESULT: {id}]\n{content}\n[/TOOL_RESULT]\n"
+                            ));
                         }
                     }
                     Some("thinking") => {
-                        if let Some(t) = block["thinking"].as_str() { out.push_str(&format!("[thinking]\n{t}\n[/thinking]\n")); }
+                        if let Some(t) = block["thinking"].as_str() {
+                            out.push_str(&format!("[thinking]\n{t}\n[/thinking]\n"));
+                        }
                     }
                     _ => {}
                 }
@@ -544,9 +644,11 @@ fn extract_system_text(system: &Option<serde_json::Value>) -> String {
     match system {
         None => String::new(),
         Some(serde_json::Value::String(s)) => s.clone(),
-        Some(serde_json::Value::Array(arr)) => {
-            arr.iter().filter_map(|v| v.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join("\n")
-        }
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
         _ => String::new(),
     }
 }
@@ -554,7 +656,9 @@ fn extract_system_text(system: &Option<serde_json::Value>) -> String {
 fn build_prompt(messages: &[Message], system: &Option<serde_json::Value>) -> String {
     let mut prompt = String::new();
     let sys = extract_system_text(system);
-    if !sys.is_empty() { prompt.push_str(&format!("[SYSTEM]\n{sys}\n[/SYSTEM]\n\n")); }
+    if !sys.is_empty() {
+        prompt.push_str(&format!("[SYSTEM]\n{sys}\n[/SYSTEM]\n\n"));
+    }
 
     for msg in messages {
         let role = match msg.role.as_str() {
@@ -562,7 +666,10 @@ fn build_prompt(messages: &[Message], system: &Option<serde_json::Value>) -> Str
             "user" => "User",
             _ => "User",
         };
-        prompt.push_str(&format!("[{role}]\n{}\n[/{role}]\n\n", extract_text(&msg.content)));
+        prompt.push_str(&format!(
+            "[{role}]\n{}\n[/{role}]\n\n",
+            extract_text(&msg.content)
+        ));
     }
     prompt.push_str("[Assistant]\n");
     prompt
@@ -572,25 +679,41 @@ fn build_prompt(messages: &[Message], system: &Option<serde_json::Value>) -> Str
 
 fn find_agent() -> Option<String> {
     if let Ok(path) = std::env::var("AGENT_PATH") {
-        if !path.is_empty() && std::path::Path::new(&path).exists() { return Some(path); }
+        if !path.is_empty() && std::path::Path::new(&path).exists() {
+            return Some(path);
+        }
     }
     // Try `command -v` (POSIX) then `which`
     for cmd in &["sh", "which"] {
-        let args: &[&str] = if *cmd == "sh" { &["-c", "command -v agent"] } else { &["agent"] };
+        let args: &[&str] = if *cmd == "sh" {
+            &["-c", "command -v agent"]
+        } else {
+            &["agent"]
+        };
         if let Ok(out) = Command::new(cmd).args(args).output() {
             if out.status.success() {
                 let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !p.is_empty() { return Some(p); }
+                if !p.is_empty() {
+                    return Some(p);
+                }
             }
         }
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    for loc in &["/usr/local/bin/agent", "/opt/homebrew/bin/agent", "/usr/bin/agent"] {
-        if std::path::Path::new(loc).exists() { return Some(loc.to_string()); }
+    for loc in &[
+        "/usr/local/bin/agent",
+        "/opt/homebrew/bin/agent",
+        "/usr/bin/agent",
+    ] {
+        if std::path::Path::new(loc).exists() {
+            return Some(loc.to_string());
+        }
     }
     if !home.is_empty() {
         let local = format!("{home}/.local/bin/agent");
-        if std::path::Path::new(&local).exists() { return Some(local); }
+        if std::path::Path::new(&local).exists() {
+            return Some(local);
+        }
     }
     None
 }
@@ -618,10 +741,7 @@ fn ensure_sandbox(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let claude_dir = dir.join(".claude");
     std::fs::create_dir_all(&claude_dir)?;
-    std::fs::write(
-        claude_dir.join("settings.local.json"),
-        SANDBOX_SETTINGS,
-    )
+    std::fs::write(claude_dir.join("settings.local.json"), SANDBOX_SETTINGS)
 }
 
 fn sandbox() -> std::io::Result<&'static PathBuf> {
@@ -663,12 +783,19 @@ struct TextStream {
 }
 
 impl TextStream {
-    fn new() -> Self { Self { segment: String::new(), pending: None } }
+    fn new() -> Self {
+        Self {
+            segment: String::new(),
+            pending: None,
+        }
+    }
 
     /// Takes the next text event. Returns whatever is now safe to emit.
     fn push(&mut self, text: &str) -> Option<String> {
         let ready = self.pending.replace(text.to_string());
-        if let Some(ref t) = ready { self.segment.push_str(t); }
+        if let Some(ref t) = ready {
+            self.segment.push_str(t);
+        }
         ready
     }
 
@@ -685,7 +812,10 @@ impl TextStream {
     }
 }
 
-fn spawn_agent(requested_model: &str, resume: Option<&str>) -> std::io::Result<std::process::Child> {
+fn spawn_agent(
+    requested_model: &str,
+    resume: Option<&str>,
+) -> std::io::Result<std::process::Child> {
     let path = agent_path();
     log(&format!("spawning: {path}"));
 
@@ -698,8 +828,16 @@ fn spawn_agent(requested_model: &str, resume: Option<&str>) -> std::io::Result<s
     // --force auto-approves tool calls in non-interactive mode.
     // --trust skips workspace trust prompt.
     let mut cmd = Command::new(path);
-    cmd.args(["--print", "--force", "--output-format", "stream-json", "--stream-partial-output",
-              "--model", requested_model, "--trust"]);
+    cmd.args([
+        "--print",
+        "--force",
+        "--output-format",
+        "stream-json",
+        "--stream-partial-output",
+        "--model",
+        requested_model,
+        "--trust",
+    ]);
     if let Some(chat_id) = resume {
         log(&format!("resuming session {chat_id}"));
         cmd.args(["--resume", chat_id]);
@@ -738,16 +876,20 @@ fn write_prompt(agent: &mut std::process::Child, prompt: &str) {
 fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
     let messages = req.messages.as_deref().unwrap_or_default();
     let model = req.model.as_deref().unwrap_or("cursor-auto");
-    let (resume, prompt) = match plan_turn(&sessions().lock().unwrap(), messages, &req.system, model) {
-        TurnPlan::Fresh { prompt } => (None, prompt),
-        TurnPlan::Resume { chat_id, prompt } => (Some(chat_id), prompt),
-    };
+    let (resume, prompt) =
+        match plan_turn(&sessions().lock().unwrap(), messages, &req.system, model) {
+            TurnPlan::Fresh { prompt } => (None, prompt),
+            TurnPlan::Resume { chat_id, prompt } => (Some(chat_id), prompt),
+        };
 
-    let mut agent = match spawn_agent(model, resume.as_deref()) { Ok(a) => a, Err(e) => {
-        let err = format!("{{\"error\":\"agent: {e}\"}}");
-        let _ = stream.write_all(format!("HTTP/1.1 500\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{err}", err.len()).as_bytes());
-        return;
-    }};
+    let mut agent = match spawn_agent(model, resume.as_deref()) {
+        Ok(a) => a,
+        Err(e) => {
+            let err = format!("{{\"error\":\"agent: {e}\"}}");
+            let _ = stream.write_all(format!("HTTP/1.1 500\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{err}", err.len()).as_bytes());
+            return;
+        }
+    };
     write_prompt(&mut agent, &prompt);
 
     let reader = BufReader::new(agent.stdout.take().unwrap());
@@ -758,24 +900,35 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
     let mut succeeded = false;
 
     for line in reader.lines() {
-        let line = match line { Ok(l) => l, _ => break };
-        if line.trim().is_empty() { continue; }
+        let line = match line {
+            Ok(l) => l,
+            _ => break,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
         if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
             if event["type"] == "assistant" {
                 if let Some(arr) = event["message"]["content"].as_array() {
                     for block in arr {
                         if let Some(t) = block["text"].as_str() {
-                            if let Some(out) = texts.push(t) { text.push_str(&out); }
+                            if let Some(out) = texts.push(t) {
+                                text.push_str(&out);
+                            }
                         }
                     }
                 }
             }
             if event["type"] == "system" && event["subtype"] == "init" {
-                if let Some(id) = event["session_id"].as_str() { chat_id = id.to_string(); }
+                if let Some(id) = event["session_id"].as_str() {
+                    chat_id = id.to_string();
+                }
             }
             // A tool call closes the current run of text, as does the result.
             if event["type"] == "tool_call" || event["type"] == "result" {
-                if let Some(out) = texts.flush() { text.push_str(&out); }
+                if let Some(out) = texts.flush() {
+                    text.push_str(&out);
+                }
             }
             if event["type"] == "result" {
                 usage = event["usage"].clone();
@@ -784,7 +937,9 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
         }
     }
     stop_and_reap_agent(&mut agent);
-    if let Some(out) = texts.flush() { text.push_str(&out); }
+    if let Some(out) = texts.flush() {
+        text.push_str(&out);
+    }
 
     // Only a completed turn may be resumed; a failed one leaves the session
     // in a state the message arithmetic no longer describes.
@@ -798,12 +953,22 @@ fn handle_blocking(mut stream: TcpStream, req: &MessagesRequest) {
         "usage": { "input_tokens": usage["inputTokens"].as_u64().unwrap_or(0), "output_tokens": usage["outputTokens"].as_u64().unwrap_or(0) }
     });
     let body = serde_json::to_string(&resp).unwrap_or_default();
-    let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes());
+    let _ = stream.write_all(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .as_bytes(),
+    );
 }
 
 // ─── Streaming ────────────────────────────────────────────────
 
-fn write_sse<W: Write>(stream: &mut W, event_type: &str, data: &serde_json::Value) -> std::io::Result<()> {
+fn write_sse<W: Write>(
+    stream: &mut W,
+    event_type: &str,
+    data: &serde_json::Value,
+) -> std::io::Result<()> {
     let json = serde_json::to_string(data)?;
     stream.write_all(b"event: ")?;
     stream.write_all(event_type.as_bytes())?;
@@ -817,18 +982,28 @@ fn write_sse<W: Write>(stream: &mut W, event_type: &str, data: &serde_json::Valu
 /// clients accumulate `content_block_start.text` plus every delta, so the
 /// start must be empty and only deltas may carry content.
 fn emit_text<W: Write>(stream: &mut W, text: &str, index: i32, block_open: &mut bool) {
-    if text.is_empty() { return; }
+    if text.is_empty() {
+        return;
+    }
     if !*block_open {
-        let _ = write_sse(stream, "content_block_start", &serde_json::json!({
-            "type": "content_block_start", "index": index,
-            "content_block": {"type": "text", "text": ""}
-        }));
+        let _ = write_sse(
+            stream,
+            "content_block_start",
+            &serde_json::json!({
+                "type": "content_block_start", "index": index,
+                "content_block": {"type": "text", "text": ""}
+            }),
+        );
         *block_open = true;
     }
-    let _ = write_sse(stream, "content_block_delta", &serde_json::json!({
-        "type": "content_block_delta", "index": index,
-        "delta": {"type": "text_delta", "text": text}
-    }));
+    let _ = write_sse(
+        stream,
+        "content_block_delta",
+        &serde_json::json!({
+            "type": "content_block_delta", "index": index,
+            "delta": {"type": "text_delta", "text": text}
+        }),
+    );
 }
 
 /// Emits a complete private reasoning block. Cursor's stream-json protocol
@@ -839,25 +1014,45 @@ fn emit_text<W: Write>(stream: &mut W, text: &str, index: i32, block_open: &mut 
 /// `thinking` block type and Paseo can render it as collapsed reasoning rather
 /// than as user-facing assistant output.
 fn emit_thinking<W: Write>(stream: &mut W, thinking: &str, index: i32) {
-    if thinking.is_empty() { return; }
-    let _ = write_sse(stream, "content_block_start", &serde_json::json!({
-        "type": "content_block_start", "index": index,
-        "content_block": {"type": "thinking", "thinking": ""}
-    }));
-    let _ = write_sse(stream, "content_block_delta", &serde_json::json!({
-        "type": "content_block_delta", "index": index,
-        "delta": {"type": "thinking_delta", "thinking": thinking}
-    }));
-    let _ = write_sse(stream, "content_block_stop", &serde_json::json!({
-        "type": "content_block_stop", "index": index
-    }));
+    if thinking.is_empty() {
+        return;
+    }
+    let _ = write_sse(
+        stream,
+        "content_block_start",
+        &serde_json::json!({
+            "type": "content_block_start", "index": index,
+            "content_block": {"type": "thinking", "thinking": ""}
+        }),
+    );
+    let _ = write_sse(
+        stream,
+        "content_block_delta",
+        &serde_json::json!({
+            "type": "content_block_delta", "index": index,
+            "delta": {"type": "thinking_delta", "thinking": thinking}
+        }),
+    );
+    let _ = write_sse(
+        stream,
+        "content_block_stop",
+        &serde_json::json!({
+            "type": "content_block_stop", "index": index
+        }),
+    );
 }
 
 fn close_text_block<W: Write>(stream: &mut W, index: i32, block_open: &mut bool) -> bool {
-    if !*block_open { return false; }
-    let _ = write_sse(stream, "content_block_stop", &serde_json::json!({
-        "type": "content_block_stop", "index": index
-    }));
+    if !*block_open {
+        return false;
+    }
+    let _ = write_sse(
+        stream,
+        "content_block_stop",
+        &serde_json::json!({
+            "type": "content_block_stop", "index": index
+        }),
+    );
     *block_open = false;
     true
 }
@@ -869,13 +1064,21 @@ fn emit_tool_use<W: Write>(
     name: &str,
     input: serde_json::Value,
 ) {
-    let _ = write_sse(stream, "content_block_start", &serde_json::json!({
-        "type": "content_block_start", "index": index,
-        "content_block": {"type": "tool_use", "id": tool_id, "name": name, "input": input}
-    }));
-    let _ = write_sse(stream, "content_block_stop", &serde_json::json!({
-        "type": "content_block_stop", "index": index
-    }));
+    let _ = write_sse(
+        stream,
+        "content_block_start",
+        &serde_json::json!({
+            "type": "content_block_start", "index": index,
+            "content_block": {"type": "tool_use", "id": tool_id, "name": name, "input": input}
+        }),
+    );
+    let _ = write_sse(
+        stream,
+        "content_block_stop",
+        &serde_json::json!({
+            "type": "content_block_stop", "index": index
+        }),
+    );
 }
 
 fn str_field<'a>(event: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
@@ -904,7 +1107,13 @@ fn nested_str_field<'a>(
 
 fn tool_call_id(event: &serde_json::Value, index: i32) -> String {
     str_field(event, &["id", "call_id", "tool_call_id"])
-        .or_else(|| nested_str_field(event, &["tool_call", "toolCall"], &["id", "call_id", "tool_call_id"]))
+        .or_else(|| {
+            nested_str_field(
+                event,
+                &["tool_call", "toolCall"],
+                &["id", "call_id", "tool_call_id"],
+            )
+        })
         .map(str::to_string)
         .unwrap_or_else(|| format!("toolu_{index}"))
 }
@@ -948,7 +1157,9 @@ fn tool_call_is_completion(event: &serde_json::Value) -> bool {
     for key in &["subtype", "status", "phase"] {
         if let Some(value) = event.get(*key).and_then(|v| v.as_str()) {
             let lower = value.to_ascii_lowercase();
-            if lower.contains("start") { return false; }
+            if lower.contains("start") {
+                return false;
+            }
             if lower.contains("complete")
                 || lower.contains("finish")
                 || lower.contains("success")
@@ -972,10 +1183,16 @@ fn emit_tool_call<W: Write>(
     index: i32,
     seen_tool_ids: &mut HashSet<String>,
 ) -> bool {
-    if tool_call_is_completion(event) { return false; }
-    let Some(name) = tool_call_name(event) else { return false; };
+    if tool_call_is_completion(event) {
+        return false;
+    }
+    let Some(name) = tool_call_name(event) else {
+        return false;
+    };
     let tool_id = tool_call_id(event, index);
-    if !seen_tool_ids.insert(tool_id.clone()) { return false; }
+    if !seen_tool_ids.insert(tool_id.clone()) {
+        return false;
+    }
     emit_tool_use(stream, index, &tool_id, name, tool_call_input(event));
     true
 }
@@ -983,16 +1200,20 @@ fn emit_tool_call<W: Write>(
 fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
     let messages = req.messages.as_deref().unwrap_or_default();
     let model = req.model.as_deref().unwrap_or("cursor-auto");
-    let (resume, prompt) = match plan_turn(&sessions().lock().unwrap(), messages, &req.system, model) {
-        TurnPlan::Fresh { prompt } => (None, prompt),
-        TurnPlan::Resume { chat_id, prompt } => (Some(chat_id), prompt),
-    };
+    let (resume, prompt) =
+        match plan_turn(&sessions().lock().unwrap(), messages, &req.system, model) {
+            TurnPlan::Fresh { prompt } => (None, prompt),
+            TurnPlan::Resume { chat_id, prompt } => (Some(chat_id), prompt),
+        };
 
-    let mut agent = match spawn_agent(model, resume.as_deref()) { Ok(a) => a, Err(e) => {
-        let err = format!("{{\"error\":\"agent: {e}\"}}");
-        let _ = stream.write_all(format!("HTTP/1.1 500\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{err}", err.len()).as_bytes());
-        return;
-    }};
+    let mut agent = match spawn_agent(model, resume.as_deref()) {
+        Ok(a) => a,
+        Err(e) => {
+            let err = format!("{{\"error\":\"agent: {e}\"}}");
+            let _ = stream.write_all(format!("HTTP/1.1 500\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{err}", err.len()).as_bytes());
+            return;
+        }
+    };
     log(&format!("prompt: {}b", prompt.len()));
     write_prompt(&mut agent, &prompt);
 
@@ -1001,10 +1222,14 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
     let _ = stream.flush();
 
     let msg_id = format!("msg_{}", std::process::id());
-    let _ = write_sse(&mut stream, "message_start", &serde_json::json!({
-        "type": "message_start",
-        "message": { "id": msg_id, "type": "message", "role": "assistant", "content": [], "model": model, "stop_reason": null, "usage": { "input_tokens": 0, "output_tokens": 0 } }
-    }));
+    let _ = write_sse(
+        &mut stream,
+        "message_start",
+        &serde_json::json!({
+            "type": "message_start",
+            "message": { "id": msg_id, "type": "message", "role": "assistant", "content": [], "model": model, "stop_reason": null, "usage": { "input_tokens": 0, "output_tokens": 0 } }
+        }),
+    );
 
     let reader = BufReader::new(agent.stdout.take().unwrap());
     let mut content_index = 0i32;
@@ -1016,8 +1241,13 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
     let mut seen_tool_ids = HashSet::new();
 
     for line in reader.lines() {
-        let line = match line { Ok(l) => l, _ => break };
-        if line.trim().is_empty() { continue; }
+        let line = match line {
+            Ok(l) => l,
+            _ => break,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
         if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
             match event["type"].as_str() {
                 Some("assistant") => {
@@ -1027,20 +1257,36 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                             match block_type {
                                 "text" => {
                                     if let Some(text) = block["text"].as_str() {
-                                        if text.is_empty() { continue; }
+                                        if text.is_empty() {
+                                            continue;
+                                        }
                                         // TextStream holds one event back so a
                                         // segment recap can be recognised and dropped.
                                         if let Some(out) = texts.push(text) {
-                                            emit_text(&mut stream, &out, content_index, &mut text_block_open);
+                                            emit_text(
+                                                &mut stream,
+                                                &out,
+                                                content_index,
+                                                &mut text_block_open,
+                                            );
                                         }
                                     }
                                 }
                                 "tool_use" => {
                                     // A tool block cannot open while text is still streaming.
                                     if let Some(out) = texts.flush() {
-                                        emit_text(&mut stream, &out, content_index, &mut text_block_open);
+                                        emit_text(
+                                            &mut stream,
+                                            &out,
+                                            content_index,
+                                            &mut text_block_open,
+                                        );
                                     }
-                                    if close_text_block(&mut stream, content_index, &mut text_block_open) {
+                                    if close_text_block(
+                                        &mut stream,
+                                        content_index,
+                                        &mut text_block_open,
+                                    ) {
                                         content_index += 1;
                                     }
                                     let name = block["name"].as_str().unwrap_or("unknown");
@@ -1054,9 +1300,18 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                                 "thinking" => {
                                     if let Some(thinking) = block["thinking"].as_str() {
                                         if let Some(out) = texts.flush() {
-                                            emit_text(&mut stream, &out, content_index, &mut text_block_open);
+                                            emit_text(
+                                                &mut stream,
+                                                &out,
+                                                content_index,
+                                                &mut text_block_open,
+                                            );
                                         }
-                                        if close_text_block(&mut stream, content_index, &mut text_block_open) {
+                                        if close_text_block(
+                                            &mut stream,
+                                            content_index,
+                                            &mut text_block_open,
+                                        ) {
                                             content_index += 1;
                                         }
                                         emit_thinking(&mut stream, thinking, content_index);
@@ -1069,7 +1324,9 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                     }
                 }
                 Some("system") if event["subtype"] == "init" => {
-                    if let Some(id) = event["session_id"].as_str() { chat_id = id.to_string(); }
+                    if let Some(id) = event["session_id"].as_str() {
+                        chat_id = id.to_string();
+                    }
                 }
                 Some("tool_call") => {
                     if let Some(out) = texts.flush() {
@@ -1092,12 +1349,20 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
                     }
                     close_text_block(&mut stream, content_index, &mut text_block_open);
                     let usage = &event["usage"];
-                    let _ = write_sse(&mut stream, "message_delta", &serde_json::json!({
-                        "type": "message_delta",
-                        "delta": {"stop_reason": "end_turn"},
-                        "usage": { "input_tokens": usage["inputTokens"].as_u64().unwrap_or(0), "output_tokens": usage["outputTokens"].as_u64().unwrap_or(0) }
-                    }));
-                    let _ = write_sse(&mut stream, "message_stop", &serde_json::json!({"type": "message_stop"}));
+                    let _ = write_sse(
+                        &mut stream,
+                        "message_delta",
+                        &serde_json::json!({
+                            "type": "message_delta",
+                            "delta": {"stop_reason": "end_turn"},
+                            "usage": { "input_tokens": usage["inputTokens"].as_u64().unwrap_or(0), "output_tokens": usage["outputTokens"].as_u64().unwrap_or(0) }
+                        }),
+                    );
+                    let _ = write_sse(
+                        &mut stream,
+                        "message_stop",
+                        &serde_json::json!({"type": "message_stop"}),
+                    );
                     let _ = stream.write_all(b"data: [DONE]\n\n");
                     let _ = stream.flush();
                 }
@@ -1113,11 +1378,19 @@ fn handle_streaming(mut stream: TcpStream, req: &MessagesRequest) {
 
     if !result_received {
         log("result not received, sending fallback message_stop");
-        let _ = write_sse(&mut stream, "message_delta", &serde_json::json!({
-            "type": "message_delta", "delta": {"stop_reason": "end_turn"},
-            "usage": {"input_tokens": 0, "output_tokens": 0}
-        }));
-        let _ = write_sse(&mut stream, "message_stop", &serde_json::json!({"type": "message_stop"}));
+        let _ = write_sse(
+            &mut stream,
+            "message_delta",
+            &serde_json::json!({
+                "type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            }),
+        );
+        let _ = write_sse(
+            &mut stream,
+            "message_stop",
+            &serde_json::json!({"type": "message_stop"}),
+        );
         let _ = stream.write_all(b"data: [DONE]\n\n");
         let _ = stream.flush();
     }
@@ -1137,8 +1410,11 @@ fn handle_messages(mut stream: TcpStream, body: &[u8], _token: &str) {
         }
     };
 
-    if req.stream.unwrap_or(true) { handle_streaming(stream, &req); }
-    else { handle_blocking(stream, &req); }
+    if req.stream.unwrap_or(true) {
+        handle_streaming(stream, &req);
+    } else {
+        handle_blocking(stream, &req);
+    }
 }
 
 // ─── Tests ─────────────────────────────────────────────────────
@@ -1153,15 +1429,22 @@ mod tests {
         let mut out = String::new();
         for seg in segments {
             for ev in *seg {
-                if let Some(t) = ts.push(ev) { out.push_str(&t); }
+                if let Some(t) = ts.push(ev) {
+                    out.push_str(&t);
+                }
             }
-            if let Some(t) = ts.flush() { out.push_str(&t); }
+            if let Some(t) = ts.flush() {
+                out.push_str(&t);
+            }
         }
         out
     }
 
     fn msg(role: &str, text: &str) -> Message {
-        Message { role: role.into(), content: serde_json::Value::String(text.into()) }
+        Message {
+            role: role.into(),
+            content: serde_json::Value::String(text.into()),
+        }
     }
 
     fn sse_payloads(bytes: &[u8]) -> Vec<serde_json::Value> {
@@ -1182,8 +1465,14 @@ mod tests {
 
     #[test]
     fn test_reminders_are_stripped_from_identity() {
-        assert_eq!(strip_reminders("<system-reminder>noise</system-reminder>\n\nhello"), "hello");
-        assert_eq!(strip_reminders("a<system-reminder>x</system-reminder>b"), "ab");
+        assert_eq!(
+            strip_reminders("<system-reminder>noise</system-reminder>\n\nhello"),
+            "hello"
+        );
+        assert_eq!(
+            strip_reminders("a<system-reminder>x</system-reminder>b"),
+            "ab"
+        );
         assert_eq!(strip_reminders("plain"), "plain");
         // An unterminated block means the remainder cannot be trusted as stable.
         assert_eq!(strip_reminders("keep<system-reminder>dangling"), "keep");
@@ -1210,13 +1499,19 @@ mod tests {
     fn test_session_survives_client_reinjected_context() {
         let mut store = HashMap::new();
         let turn1 = vec![
-            msg("user", "<system-reminder>turn one</system-reminder>\n\nRemember 7."),
+            msg(
+                "user",
+                "<system-reminder>turn one</system-reminder>\n\nRemember 7.",
+            ),
             msg("system", "hook context, ends with a newline\n"),
         ];
         serve(&mut store, &turn1, "sonnet-4.5");
 
         let turn2 = vec![
-            msg("user", "<system-reminder>turn two, different</system-reminder>\n\nRemember 7."),
+            msg(
+                "user",
+                "<system-reminder>turn two, different</system-reminder>\n\nRemember 7.",
+            ),
             msg("system", "hook context, ends with a newline"),
             msg("assistant", "OK"),
             msg("user", "What number?"),
@@ -1225,8 +1520,14 @@ mod tests {
         match plan_turn(&store, &turn2, &None, "sonnet-4.5") {
             TurnPlan::Resume { prompt, .. } => {
                 assert!(prompt.contains("What number?"), "the new question is sent");
-                assert!(!prompt.contains("Remember 7."), "history stays in the session");
-                assert!(prompt.contains("14999"), "context after the new turn still travels");
+                assert!(
+                    !prompt.contains("Remember 7."),
+                    "history stays in the session"
+                );
+                assert!(
+                    prompt.contains("14999"),
+                    "context after the new turn still travels"
+                );
             }
             TurnPlan::Fresh { .. } => panic!("re-injected context must not defeat the session"),
         }
@@ -1254,7 +1555,10 @@ mod tests {
                 assert_eq!(chat_id, "chat-1");
                 assert!(prompt.contains("u2"), "new message must be sent");
                 assert!(!prompt.contains("u1"), "history is already in the session");
-                assert!(!prompt.contains("a1"), "the reply is already in the session");
+                assert!(
+                    !prompt.contains("a1"),
+                    "the reply is already in the session"
+                );
             }
             TurnPlan::Fresh { .. } => panic!("second turn should resume"),
         }
@@ -1267,12 +1571,20 @@ mod tests {
         let turn2 = vec![msg("user", "u1"), msg("assistant", "a1"), msg("user", "u2")];
         serve(&mut store, &turn2, "sonnet-4.5");
 
-        let turn3 = vec![msg("user", "u1"), msg("assistant", "a1"), msg("user", "u2"),
-                         msg("assistant", "a2"), msg("user", "u3")];
+        let turn3 = vec![
+            msg("user", "u1"),
+            msg("assistant", "a1"),
+            msg("user", "u2"),
+            msg("assistant", "a2"),
+            msg("user", "u3"),
+        ];
         match plan_turn(&store, &turn3, &None, "sonnet-4.5") {
             TurnPlan::Resume { prompt, .. } => {
                 assert!(prompt.contains("u3"));
-                assert!(!prompt.contains("u2"), "u2 was consumed by the previous turn");
+                assert!(
+                    !prompt.contains("u2"),
+                    "u2 was consumed by the previous turn"
+                );
             }
             TurnPlan::Fresh { .. } => panic!("third turn should resume"),
         }
@@ -1286,10 +1598,17 @@ mod tests {
         serve(&mut store, &turn2, "sonnet-4.5");
 
         // The user edits u2 and resends; the session's history no longer applies.
-        let forked = vec![msg("user", "u1"), msg("assistant", "a1"), msg("user", "EDITED"),
-                          msg("assistant", "a2"), msg("user", "u3")];
+        let forked = vec![
+            msg("user", "u1"),
+            msg("assistant", "a1"),
+            msg("user", "EDITED"),
+            msg("assistant", "a2"),
+            msg("user", "u3"),
+        ];
         match plan_turn(&store, &forked, &None, "sonnet-4.5") {
-            TurnPlan::Fresh { prompt } => assert!(prompt.contains("u1"), "full history is replayed"),
+            TurnPlan::Fresh { prompt } => {
+                assert!(prompt.contains("u1"), "full history is replayed")
+            }
             TurnPlan::Resume { .. } => panic!("a rewritten prefix must not reuse the session"),
         }
     }
@@ -1302,8 +1621,12 @@ mod tests {
         serve(&mut store, &turn2, "sonnet-4.5");
 
         // History compacted: a turn disappeared, so positions no longer line up.
-        let compacted = vec![msg("user", "u1"), msg("user", "u2"), msg("assistant", "a2"),
-                             msg("user", "u3")];
+        let compacted = vec![
+            msg("user", "u1"),
+            msg("user", "u2"),
+            msg("assistant", "a2"),
+            msg("user", "u3"),
+        ];
         match plan_turn(&store, &compacted, &None, "sonnet-4.5") {
             TurnPlan::Fresh { .. } => {}
             TurnPlan::Resume { .. } => panic!("a reordered prefix must not reuse the session"),
@@ -1337,7 +1660,11 @@ mod tests {
     fn test_distinct_conversations_get_distinct_sessions() {
         let mut store = HashMap::new();
         serve(&mut store, &[msg("user", "u1")], "sonnet-4.5");
-        let other = vec![msg("user", "different opening"), msg("assistant", "a"), msg("user", "b")];
+        let other = vec![
+            msg("user", "different opening"),
+            msg("assistant", "a"),
+            msg("user", "b"),
+        ];
         match plan_turn(&store, &other, &None, "sonnet-4.5") {
             TurnPlan::Fresh { .. } => {}
             TurnPlan::Resume { .. } => panic!("unrelated conversation must not reuse the session"),
@@ -1355,8 +1682,13 @@ mod tests {
     #[test]
     fn test_segment_recap_is_dropped() {
         // Deltas, then the recap repeating the whole segment.
-        let out = render(&[&["I", "'ll run that", " command", " for you.",
-                             "I'll run that command for you."]]);
+        let out = render(&[&[
+            "I",
+            "'ll run that",
+            " command",
+            " for you.",
+            "I'll run that command for you.",
+        ]]);
         assert_eq!(out, "I'll run that command for you.");
     }
 
@@ -1474,7 +1806,10 @@ mod tests {
         assert_eq!(payloads[0]["content_block"]["thinking"], "");
         assert_eq!(payloads[1]["type"], "content_block_delta");
         assert_eq!(payloads[1]["delta"]["type"], "thinking_delta");
-        assert_eq!(payloads[1]["delta"]["thinking"], "I should inspect the stream shape.");
+        assert_eq!(
+            payloads[1]["delta"]["thinking"],
+            "I should inspect the stream shape."
+        );
         assert_eq!(payloads[2]["type"], "content_block_stop");
     }
 
@@ -1629,7 +1964,8 @@ mod tests {
         assert!(first.is_dir(), "sandbox dir must exist on disk");
 
         let settings = first.join(".claude/settings.local.json");
-        let contents = std::fs::read_to_string(&settings).expect("settings.local.json must be written");
+        let contents =
+            std::fs::read_to_string(&settings).expect("settings.local.json must be written");
         let v: serde_json::Value = serde_json::from_str(&contents).unwrap();
         assert_eq!(v["enabledPlugins"]["context-mode@context-mode"], false);
 
