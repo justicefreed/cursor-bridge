@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -30,6 +31,8 @@ fn main() {
         println!("  cursor-bridge -p \"prompt\"  pipe mode");
         return;
     }
+
+    install_signal_handlers();
 
     let token = get_cursor_token();
     if token.is_empty() {
@@ -66,7 +69,41 @@ fn main() {
 
     let status = child.wait();
     drop(proxy);
+    cleanup_sandbox();
     std::process::exit(status.ok().and_then(|s| s.code()).unwrap_or(0));
+}
+
+// ─── Shutdown ─────────────────────────────────────────────────
+
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" {
+    fn signal(signum: i32, handler: usize) -> usize;
+}
+
+const SIGINT: i32 = 2;
+const SIGTERM: i32 = 15;
+
+extern "C" fn request_shutdown(_sig: i32) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// Traps SIGINT/SIGTERM so the sandbox is still removed when the session is
+/// killed rather than exiting normally. The handler only flips a flag —
+/// `remove_dir_all` is not async-signal-safe — and a watcher thread does the
+/// actual cleanup and exit.
+fn install_signal_handlers() {
+    unsafe {
+        signal(SIGINT, request_shutdown as *const () as usize);
+        signal(SIGTERM, request_shutdown as *const () as usize);
+    }
+    std::thread::Builder::new().name("bridge-shutdown".into()).spawn(|| loop {
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            cleanup_sandbox();
+            std::process::exit(130);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }).ok();
 }
 
 // ─── Token ────────────────────────────────────────────────────
@@ -511,6 +548,52 @@ fn find_agent() -> Option<String> {
     None
 }
 
+/// Resolves the `agent` binary once per bridge session instead of shelling
+/// out to `command -v`/`which` on every spawn.
+fn agent_path() -> &'static str {
+    static AGENT_PATH: OnceLock<String> = OnceLock::new();
+    AGENT_PATH.get_or_init(|| {
+        find_agent().unwrap_or_else(|| {
+            log("agent not found. Install Cursor CLI or set AGENT_PATH.");
+            std::process::exit(1);
+        })
+    })
+}
+
+/// One sandbox directory per bridge session, created on first use and
+/// reused by every subsequent spawn. context-mode is disabled inside it so
+/// its hooks don't fire (and rebuild `better-sqlite3`) on every tool call.
+static SANDBOX: OnceLock<PathBuf> = OnceLock::new();
+
+const SANDBOX_SETTINGS: &str = r#"{"enabledPlugins":{"context-mode@context-mode":false}}"#;
+
+fn ensure_sandbox(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let claude_dir = dir.join(".claude");
+    std::fs::create_dir_all(&claude_dir)?;
+    std::fs::write(
+        claude_dir.join("settings.local.json"),
+        SANDBOX_SETTINGS,
+    )
+}
+
+fn sandbox() -> std::io::Result<&'static PathBuf> {
+    let dir = SANDBOX.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("cursor-bridge-{}", std::process::id()));
+        log(&format!("sandbox: {}", dir.display()));
+        dir
+    });
+    ensure_sandbox(dir)?;
+    Ok(dir)
+}
+
+/// Removes the session sandbox. Called once, at process exit.
+fn cleanup_sandbox() {
+    if let Some(dir) = SANDBOX.get() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 /// Collapses the agent's text events into the reply the user should see.
 ///
 /// With `--stream-partial-output` the agent streams incremental text events
@@ -556,13 +639,13 @@ impl TextStream {
 }
 
 fn spawn_agent(requested_model: &str, resume: Option<&str>) -> std::io::Result<std::process::Child> {
-    let path = find_agent().unwrap_or_else(|| { log("agent not found. Install Cursor CLI or set AGENT_PATH."); std::process::exit(1); });
+    let path = agent_path();
     log(&format!("spawning: {path}"));
 
-    // Run agent in temp dir so it can't touch project files
-    let sandbox = std::env::temp_dir().join(format!("cursor-bridge-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&sandbox);
-    log(&format!("sandbox: {}", sandbox.display()));
+    // Run agent in the session's sandbox dir so it can't touch project files.
+    // The local `.claude/settings.local.json` there disables context-mode
+    // while preserving HOME for the agent's normal auth/session state.
+    let sandbox = sandbox()?;
 
     // Default mode (no --mode) = full agent with tool execution.
     // --force auto-approves tool calls in non-interactive mode.
@@ -574,7 +657,7 @@ fn spawn_agent(requested_model: &str, resume: Option<&str>) -> std::io::Result<s
         log(&format!("resuming session {chat_id}"));
         cmd.args(["--resume", chat_id]);
     }
-    cmd.current_dir(&sandbox)
+    cmd.current_dir(sandbox)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -688,6 +771,7 @@ fn emit_text<W: Write>(stream: &mut W, text: &str, index: i32, block_open: &mut 
     }));
 }
 
+<<<<<<< HEAD
 /// Emits a complete private reasoning block. Cursor's stream-json protocol
 /// delivers reasoning as a completed assistant content block, unlike text
 /// which arrives incrementally and needs recap suppression.
@@ -710,6 +794,8 @@ fn emit_thinking<W: Write>(stream: &mut W, thinking: &str, index: i32) {
     }));
 }
 
+=======
+>>>>>>> main
 fn close_text_block<W: Write>(stream: &mut W, index: i32, block_open: &mut bool) -> bool {
     if !*block_open { return false; }
     let _ = write_sse(stream, "content_block_stop", &serde_json::json!({
@@ -1318,6 +1404,7 @@ mod tests {
     }
 
     #[test]
+<<<<<<< HEAD
     fn test_thinking_is_emitted_as_a_private_reasoning_block() {
         let mut out = Vec::new();
 
@@ -1336,6 +1423,8 @@ mod tests {
     }
 
     #[test]
+=======
+>>>>>>> main
     fn test_extract_system_text_string() {
         let v = Some(serde_json::Value::String("Be helpful.".into()));
         assert_eq!(extract_system_text(&v), "Be helpful.");
@@ -1471,5 +1560,49 @@ mod tests {
         ]}"#;
         let v: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(v["data"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_sandbox_is_created_once_reused_and_removed_on_cleanup() {
+        // sandbox() is a session-wide OnceLock: every call must return the
+        // same directory instead of minting a new one, and it must carry the
+        // context-mode opt-out from the moment it is created.
+        let first = sandbox().unwrap().clone();
+        let second = sandbox().unwrap().clone();
+        let third = sandbox().unwrap().clone();
+        assert_eq!(first, second, "repeated calls must reuse the same sandbox");
+        assert_eq!(second, third, "repeated calls must reuse the same sandbox");
+        assert!(first.is_dir(), "sandbox dir must exist on disk");
+
+        let settings = first.join(".claude/settings.local.json");
+        let contents = std::fs::read_to_string(&settings).expect("settings.local.json must be written");
+        let v: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(v["enabledPlugins"]["context-mode@context-mode"], false);
+
+        cleanup_sandbox();
+        assert!(!first.exists(), "cleanup must remove the sandbox dir");
+    }
+
+    #[test]
+    fn test_ensure_sandbox_writes_context_mode_opt_out() {
+        let dir = std::env::temp_dir().join(format!(
+            "cursor-bridge-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        ensure_sandbox(&dir).unwrap();
+
+        let settings = dir.join(".claude/settings.local.json");
+        let contents = std::fs::read_to_string(&settings).unwrap();
+        assert_eq!(contents, SANDBOX_SETTINGS);
+
+        let v: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        assert_eq!(v["enabledPlugins"]["context-mode@context-mode"], false);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
